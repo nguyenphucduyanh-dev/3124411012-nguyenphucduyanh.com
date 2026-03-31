@@ -1,393 +1,314 @@
 <?php
 /**
- * search.php - Tìm kiếm sản phẩm (AJAX + hiển thị)
+ * search.php - Tìm kiếm sản phẩm (AJAX + phân trang)
  * Tác giả: nguyenphucduyanh-dev
  */
 
-session_start();
-require_once __DIR__ . '/includes/functions.php';
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/function.php';
 
-// -----------------------------------------------
-// Xử lý AJAX request
-// -----------------------------------------------
-if (isset($_GET['ajax']) && $_GET['ajax'] === '1') {
-    header('Content-Type: application/json; charset=utf-8');
+cartInit();
 
-    $keyword    = trim($_GET['keyword'] ?? '');
-    $categoryId = isset($_GET['category_id']) && $_GET['category_id'] !== '' ? (int)$_GET['category_id'] : null;
-    $priceMin   = isset($_GET['price_min']) && $_GET['price_min'] !== '' ? (float)$_GET['price_min'] : null;
-    $priceMax   = isset($_GET['price_max']) && $_GET['price_max'] !== '' ? (float)$_GET['price_max'] : null;
-    $page       = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
+const PER_PAGE = 12;
 
-    $result = searchProducts($keyword, $categoryId, $priceMin, $priceMax, $page, 12);
+$is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH'])
+        && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
 
-    echo json_encode($result, JSON_UNESCAPED_UNICODE);
-    exit;
+// --- Đọc tham số ---
+$keyword     = trim($_GET['keyword']    ?? '');
+$category_id = (int) ($_GET['category'] ?? 0);
+$price_min   = isset($_GET['price_min']) && $_GET['price_min'] !== '' ? (float)$_GET['price_min'] : null;
+$price_max   = isset($_GET['price_max']) && $_GET['price_max'] !== '' ? (float)$_GET['price_max'] : null;
+$page        = max(1, (int)($_GET['page'] ?? 1));
+$offset      = ($page - 1) * PER_PAGE;
+
+// --- Build WHERE ---
+$where  = ["p.is_active = 1"];
+$params = [];
+
+if ($keyword !== '') {
+    $where[]  = "p.name LIKE :keyword";
+    $params[':keyword'] = '%' . $keyword . '%';
+}
+if ($category_id > 0) {
+    $where[]  = "p.category_id = :cat";
+    $params[':cat'] = $category_id;
+}
+// Khoảng giá so sánh với selling_price = import_price * (1 + profit_rate)
+if ($price_min !== null) {
+    $where[]  = "(p.import_price * (1 + p.profit_rate)) >= :pmin";
+    $params[':pmin'] = $price_min;
+}
+if ($price_max !== null) {
+    $where[]  = "(p.import_price * (1 + p.profit_rate)) <= :pmax";
+    $params[':pmax'] = $price_max;
 }
 
-// -----------------------------------------------
-// Lấy danh sách categories cho bộ lọc
-// -----------------------------------------------
+$whereSQL = implode(' AND ', $where);
+
 $pdo = getDBConnection();
-$categories = $pdo->query("SELECT category_id, category_name FROM categories WHERE is_active = 1 ORDER BY category_name")->fetchAll();
+
+// --- Đếm tổng ---
+$count_sql  = "SELECT COUNT(*) FROM products p WHERE $whereSQL";
+$count_stmt = $pdo->prepare($count_sql);
+$count_stmt->execute($params);
+$total      = (int) $count_stmt->fetchColumn();
+$total_pages = (int) ceil($total / PER_PAGE);
+
+// --- Lấy dữ liệu ---
+$sql  = "SELECT p.id, p.name, p.slug, p.image,
+                p.import_price, p.profit_rate, p.stock_quantity,
+                (p.import_price * (1 + p.profit_rate)) AS selling_price,
+                c.name AS category_name
+         FROM products p
+         JOIN categories c ON c.id = p.category_id
+         WHERE $whereSQL
+         ORDER BY p.id DESC
+         LIMIT :limit OFFSET :offset";
+
+$stmt = $pdo->prepare($sql);
+foreach ($params as $k => $v) $stmt->bindValue($k, $v);
+$stmt->bindValue(':limit',  PER_PAGE, PDO::PARAM_INT);
+$stmt->bindValue(':offset', $offset,  PDO::PARAM_INT);
+$stmt->execute();
+$products = $stmt->fetchAll();
+
+// --- Lấy danh mục cho filter ---
+$categories = $pdo->query("SELECT id, name FROM categories ORDER BY name")->fetchAll();
+
+// ====== AJAX: trả về JSON ======
+if ($is_ajax) {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode([
+        'total'       => $total,
+        'total_pages' => $total_pages,
+        'current_page'=> $page,
+        'products'    => $products,
+    ]);
+    exit;
+}
 ?>
 <!DOCTYPE html>
 <html lang="vi">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tìm kiếm sản phẩm - Website Bán Điện Thoại</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Segoe UI', Tahoma, Arial, sans-serif; background: #f5f5f5; color: #333; }
-
-        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-
-        /* Header */
-        .page-header { background: #1a73e8; color: #fff; padding: 20px; text-align: center; margin-bottom: 20px; border-radius: 8px; }
-        .page-header h1 { font-size: 24px; }
-
-        /* Search Form */
-        .search-form { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        .search-form .form-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
-        .search-form .form-group { flex: 1; min-width: 180px; }
-        .search-form label { display: block; font-weight: 600; margin-bottom: 4px; font-size: 14px; }
-        .search-form input, .search-form select {
-            width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px;
-            font-size: 14px; transition: border-color 0.2s;
-        }
-        .search-form input:focus, .search-form select:focus { border-color: #1a73e8; outline: none; }
-        .btn-search {
-            background: #1a73e8; color: #fff; border: none; padding: 10px 24px;
-            border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600;
-            transition: background 0.2s;
-        }
-        .btn-search:hover { background: #1557b0; }
-
-        /* Product Grid */
-        .results-info { padding: 10px 0; font-size: 14px; color: #666; }
-        .product-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 20px; }
-        .product-card {
-            background: #fff; border-radius: 8px; overflow: hidden;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.08); transition: transform 0.2s, box-shadow 0.2s;
-        }
-        .product-card:hover { transform: translateY(-4px); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
-        .product-card .card-img {
-            width: 100%; height: 200px; background: #e8e8e8;
-            display: flex; align-items: center; justify-content: center;
-            font-size: 48px; color: #bbb;
-        }
-        .product-card .card-body { padding: 16px; }
-        .product-card .card-title { font-size: 16px; font-weight: 600; margin-bottom: 6px; line-height: 1.3; }
-        .product-card .card-category { font-size: 12px; color: #888; margin-bottom: 8px; }
-        .product-card .card-price { font-size: 18px; font-weight: 700; color: #e53935; }
-        .product-card .card-stock { font-size: 12px; color: #999; margin-top: 4px; }
-        .product-card .btn-add-cart {
-            display: block; width: 100%; margin-top: 12px; padding: 10px;
-            background: #ff6f00; color: #fff; border: none; border-radius: 6px;
-            cursor: pointer; font-weight: 600; font-size: 14px;
-            transition: background 0.2s;
-        }
-        .product-card .btn-add-cart:hover { background: #e65100; }
-
-        /* Pagination */
-        .pagination { display: flex; justify-content: center; gap: 6px; margin-top: 30px; flex-wrap: wrap; }
-        .pagination button {
-            padding: 8px 14px; border: 1px solid #ddd; background: #fff; border-radius: 6px;
-            cursor: pointer; font-size: 14px; transition: all 0.2s;
-        }
-        .pagination button:hover { border-color: #1a73e8; color: #1a73e8; }
-        .pagination button.active { background: #1a73e8; color: #fff; border-color: #1a73e8; }
-        .pagination button:disabled { opacity: 0.4; cursor: not-allowed; }
-
-        /* Loading & Empty */
-        .loading { text-align: center; padding: 40px; font-size: 16px; color: #999; }
-        .no-results { text-align: center; padding: 60px 20px; color: #999; }
-        .no-results p { font-size: 18px; }
-
-        /* Toast notification */
-        .toast {
-            position: fixed; bottom: 20px; right: 20px; background: #333; color: #fff;
-            padding: 14px 24px; border-radius: 8px; font-size: 14px; z-index: 1000;
-            opacity: 0; transition: opacity 0.3s; pointer-events: none;
-        }
-        .toast.show { opacity: 1; }
-
-        @media (max-width: 600px) {
-            .search-form .form-row { flex-direction: column; }
-            .product-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tìm kiếm sản phẩm</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<style>
+    .product-card img { height:200px; object-fit:contain; }
+    .pagination .page-item.active .page-link { background:#0d6efd; border-color:#0d6efd; }
+    #loading { display:none; text-align:center; padding:40px; }
+</style>
 </head>
 <body>
-
-<div class="container">
-    <div class="page-header">
-        <h1>🔍 Tìm kiếm điện thoại</h1>
-    </div>
+<div class="container py-4">
+    <h2 class="mb-4">🔍 Tìm kiếm điện thoại</h2>
 
     <!-- Form tìm kiếm -->
-    <div class="search-form">
-        <div class="form-row">
-            <div class="form-group">
-                <label for="keyword">Tên sản phẩm</label>
-                <input type="text" id="keyword" placeholder="VD: iPhone, Samsung...">
-            </div>
-            <div class="form-group">
-                <label for="category_id">Danh mục</label>
-                <select id="category_id">
-                    <option value="">-- Tất cả --</option>
-                    <?php foreach ($categories as $cat): ?>
-                        <option value="<?= $cat['category_id'] ?>">
-                            <?= htmlspecialchars($cat['category_name']) ?>
-                        </option>
-                    <?php endforeach; ?>
-                </select>
-            </div>
-            <div class="form-group">
-                <label for="price_min">Giá từ (₫)</label>
-                <input type="number" id="price_min" placeholder="0" min="0">
-            </div>
-            <div class="form-group">
-                <label for="price_max">Giá đến (₫)</label>
-                <input type="number" id="price_max" placeholder="50000000" min="0">
-            </div>
-            <div class="form-group" style="flex: 0 0 auto;">
-                <button class="btn-search" onclick="doSearch(1)">Tìm kiếm</button>
-            </div>
+    <form id="searchForm" class="row g-3 mb-4">
+        <div class="col-md-4">
+            <input type="text" name="keyword" id="keyword" class="form-control"
+                   placeholder="Tên sản phẩm..." value="<?= e($keyword) ?>">
         </div>
-    </div>
+        <div class="col-md-2">
+            <select name="category" id="category" class="form-select">
+                <option value="">-- Tất cả danh mục --</option>
+                <?php foreach ($categories as $cat): ?>
+                <option value="<?= $cat['id'] ?>"
+                    <?= $category_id == $cat['id'] ? 'selected' : '' ?>>
+                    <?= e($cat['name']) ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="col-md-2">
+            <input type="number" name="price_min" id="price_min" class="form-control"
+                   placeholder="Giá từ (đ)"
+                   value="<?= $price_min !== null ? (int)$price_min : '' ?>">
+        </div>
+        <div class="col-md-2">
+            <input type="number" name="price_max" id="price_max" class="form-control"
+                   placeholder="Giá đến (đ)"
+                   value="<?= $price_max !== null ? (int)$price_max : '' ?>">
+        </div>
+        <div class="col-md-2">
+            <button type="submit" class="btn btn-primary w-100">Tìm kiếm</button>
+        </div>
+    </form>
 
     <!-- Kết quả -->
-    <div class="results-info" id="resultsInfo"></div>
-    <div class="product-grid" id="productGrid"></div>
-    <div class="pagination" id="pagination"></div>
+    <div id="resultInfo" class="text-muted mb-3">
+        Tìm thấy <strong><?= $total ?></strong> sản phẩm
+    </div>
+
+    <div id="loading"><div class="spinner-border text-primary"></div></div>
+
+    <div id="productGrid" class="row row-cols-2 row-cols-md-3 row-cols-lg-4 g-4">
+        <?php foreach ($products as $p): ?>
+        <?= renderProductCard($p) ?>
+        <?php endforeach; ?>
+    </div>
+
+    <!-- Pagination -->
+    <nav id="paginationWrap" class="mt-4 d-flex justify-content-center">
+        <?= renderPagination($page, $total_pages) ?>
+    </nav>
 </div>
 
-<!-- Toast -->
-<div class="toast" id="toast"></div>
-
 <script>
-/**
- * JavaScript AJAX Search - Website Bán Điện Thoại
- * Tác giả: nguyenphucduyanh-dev
- */
+let currentPage = <?= $page ?>;
 
-let currentPage = 1;
+const form = document.getElementById('searchForm');
+const grid = document.getElementById('productGrid');
+const info = document.getElementById('resultInfo');
+const loading = document.getElementById('loading');
+const paginationWrap = document.getElementById('paginationWrap');
 
-// Tự động tìm kiếm khi tải trang
-document.addEventListener('DOMContentLoaded', function() {
-    doSearch(1);
+function buildParams(page) {
+    const data = new FormData(form);
+    data.set('page', page);
+    return new URLSearchParams(data).toString();
+}
 
-    // Enter để tìm kiếm
-    document.getElementById('keyword').addEventListener('keypress', function(e) {
-        if (e.key === 'Enter') doSearch(1);
-    });
-});
-
-/**
- * Hàm tìm kiếm sản phẩm bằng AJAX
- */
 function doSearch(page) {
     currentPage = page;
+    loading.style.display = 'block';
+    grid.style.opacity = '0.4';
 
-    const keyword    = document.getElementById('keyword').value.trim();
-    const categoryId = document.getElementById('category_id').value;
-    const priceMin   = document.getElementById('price_min').value;
-    const priceMax   = document.getElementById('price_max').value;
-
-    // Xây dựng URL query
-    const params = new URLSearchParams({
-        ajax: '1',
-        keyword: keyword,
-        category_id: categoryId,
-        price_min: priceMin,
-        price_max: priceMax,
-        page: page
+    fetch('search.php?' + buildParams(page), {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(r => r.json())
+    .then(data => {
+        loading.style.display = 'none';
+        grid.style.opacity = '1';
+        info.innerHTML = `Tìm thấy <strong>${data.total}</strong> sản phẩm`;
+        grid.innerHTML = data.products.map(renderCard).join('');
+        paginationWrap.innerHTML = renderPagination(data.current_page, data.total_pages);
+        // Cập nhật URL không reload
+        history.replaceState(null, '', 'search.php?' + buildParams(page));
+    })
+    .catch(() => {
+        loading.style.display = 'none';
+        grid.style.opacity = '1';
     });
-
-    // Hiển thị loading
-    document.getElementById('productGrid').innerHTML = '<div class="loading">⏳ Đang tìm kiếm...</div>';
-    document.getElementById('pagination').innerHTML = '';
-    document.getElementById('resultsInfo').innerHTML = '';
-
-    // Gọi AJAX
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', 'search.php?' + params.toString(), true);
-    xhr.setRequestHeader('Accept', 'application/json');
-
-    xhr.onreadystatechange = function() {
-        if (xhr.readyState === 4) {
-            if (xhr.status === 200) {
-                try {
-                    const data = JSON.parse(xhr.responseText);
-                    renderProducts(data);
-                    renderPagination(data);
-                    renderResultsInfo(data);
-                } catch (e) {
-                    document.getElementById('productGrid').innerHTML =
-                        '<div class="no-results"><p>❌ Lỗi xử lý dữ liệu.</p></div>';
-                }
-            } else {
-                document.getElementById('productGrid').innerHTML =
-                    '<div class="no-results"><p>❌ Lỗi kết nối server.</p></div>';
-            }
-        }
-    };
-
-    xhr.send();
 }
 
-/**
- * Render danh sách sản phẩm
- */
-function renderProducts(data) {
-    const grid = document.getElementById('productGrid');
-    const products = data.products;
-
-    if (!products || products.length === 0) {
-        grid.innerHTML = '<div class="no-results"><p>📱 Không tìm thấy sản phẩm nào.</p></div>';
-        return;
-    }
-
-    let html = '';
-    products.forEach(function(p) {
-        const price     = formatCurrency(p.selling_price);
-        const stockText = p.stock_quantity > 0 ? ('Còn ' + p.stock_quantity + ' sản phẩm') : 'Hết hàng';
-        const stockClass = p.stock_quantity > 0 ? '' : 'color: #e53935;';
-        const btnDisabled = p.stock_quantity <= 0 ? 'disabled style="opacity:0.5;cursor:not-allowed;"' : '';
-
-        html += `
-            <div class="product-card">
-                <div class="card-img">📱</div>
-                <div class="card-body">
-                    <div class="card-title">${escapeHtml(p.product_name)}</div>
-                    <div class="card-category">${escapeHtml(p.category_name)}</div>
-                    <div class="card-price">${price}</div>
-                    <div class="card-stock" style="${stockClass}">${stockText}</div>
-                    <button class="btn-add-cart" onclick="addToCart(${p.product_id})" ${btnDisabled}>
-                        🛒 Thêm vào giỏ
-                    </button>
-                </div>
-            </div>
-        `;
-    });
-
-    grid.innerHTML = html;
+function renderCard(p) {
+    const price = new Intl.NumberFormat('vi-VN').format(Math.round(p.selling_price));
+    const img   = p.image ? p.image : 'assets/images/no-image.png';
+    return `
+    <div class="col">
+      <div class="card h-100 shadow-sm">
+        <img src="${img}" class="card-img-top p-2" alt="${p.name}" style="height:200px;object-fit:contain">
+        <div class="card-body d-flex flex-column">
+          <span class="badge bg-secondary mb-1">${p.category_name}</span>
+          <h6 class="card-title flex-grow-1">${p.name}</h6>
+          <p class="fw-bold text-danger mb-1">${price} đ</p>
+          <p class="text-muted small mb-2">Còn: ${p.stock_quantity} máy</p>
+          <div class="d-flex gap-2">
+            <a href="pages/product_detail.php?id=${p.id}" class="btn btn-outline-primary btn-sm flex-grow-1">Chi tiết</a>
+            <button onclick="addToCart(${p.id})" class="btn btn-danger btn-sm flex-grow-1">🛒 Mua</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
 }
 
-/**
- * Render phân trang
- */
-function renderPagination(data) {
-    const container  = document.getElementById('pagination');
-    const totalPages = data.total_pages;
-    const current    = data.current_page;
-
-    if (totalPages <= 1) {
-        container.innerHTML = '';
-        return;
+function renderPagination(current, total) {
+    if (total <= 1) return '';
+    let html = '<ul class="pagination">';
+    if (current > 1) {
+        html += `<li class="page-item"><a class="page-link" href="#" onclick="doSearch(${current-1});return false;">«</a></li>`;
     }
-
-    let html = '';
-
-    // Nút Previous
-    html += `<button onclick="doSearch(${current - 1})" ${current <= 1 ? 'disabled' : ''}>« Trước</button>`;
-
-    // Hiển thị tối đa 7 trang xung quanh trang hiện tại
-    let startPage = Math.max(1, current - 3);
-    let endPage   = Math.min(totalPages, current + 3);
-
-    if (startPage > 1) {
-        html += `<button onclick="doSearch(1)">1</button>`;
-        if (startPage > 2) {
-            html += `<button disabled>...</button>`;
-        }
+    const start = Math.max(1, current - 2);
+    const end   = Math.min(total, current + 2);
+    for (let i = start; i <= end; i++) {
+        html += `<li class="page-item ${i===current?'active':''}">
+                   <a class="page-link" href="#" onclick="doSearch(${i});return false;">${i}</a>
+                 </li>`;
     }
-
-    for (let i = startPage; i <= endPage; i++) {
-        const activeClass = (i === current) ? 'active' : '';
-        html += `<button class="${activeClass}" onclick="doSearch(${i})">${i}</button>`;
+    if (current < total) {
+        html += `<li class="page-item"><a class="page-link" href="#" onclick="doSearch(${current+1});return false;">»</a></li>`;
     }
-
-    if (endPage < totalPages) {
-        if (endPage < totalPages - 1) {
-            html += `<button disabled>...</button>`;
-        }
-        html += `<button onclick="doSearch(${totalPages})">${totalPages}</button>`;
-    }
-
-    // Nút Next
-    html += `<button onclick="doSearch(${current + 1})" ${current >= totalPages ? 'disabled' : ''}>Sau »</button>`;
-
-    container.innerHTML = html;
+    html += '</ul>';
+    return html;
 }
 
-/**
- * Render thông tin kết quả
- */
-function renderResultsInfo(data) {
-    const info = document.getElementById('resultsInfo');
-    if (data.total > 0) {
-        const from = (data.current_page - 1) * data.per_page + 1;
-        const to   = Math.min(data.current_page * data.per_page, data.total);
-        info.innerHTML = `Hiển thị ${from} - ${to} trong tổng số <strong>${data.total}</strong> sản phẩm (Trang ${data.current_page}/${data.total_pages})`;
-    } else {
-        info.innerHTML = '';
-    }
-}
-
-/**
- * Thêm vào giỏ hàng (AJAX)
- */
 function addToCart(productId) {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', 'cart.php', true);
-    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
-
-    xhr.onreadystatechange = function() {
-        if (xhr.readyState === 4 && xhr.status === 200) {
-            try {
-                const resp = JSON.parse(xhr.responseText);
-                showToast(resp.message, resp.success);
-            } catch (e) {
-                showToast('Lỗi xử lý.', false);
+    fetch('cart.php?action=add&product_id=' + productId, {
+        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+    })
+    .then(r => r.json())
+    .then(d => {
+        if (d.success) {
+            alert('✅ ' + d.message);
+        } else {
+            if (d.message.includes('đăng nhập')) {
+                window.location.href = 'login.php';
+            } else {
+                alert('❌ ' + d.message);
             }
         }
-    };
-
-    xhr.send('action=add&product_id=' + productId + '&quantity=1');
+    });
 }
 
-/**
- * Hiển thị thông báo toast
- */
-function showToast(message, success) {
-    const toast = document.getElementById('toast');
-    toast.textContent = (success ? '✅ ' : '⚠️ ') + message;
-    toast.style.background = success ? '#2e7d32' : '#c62828';
-    toast.classList.add('show');
-    setTimeout(function() {
-        toast.classList.remove('show');
-    }, 3000);
-}
+form.addEventListener('submit', function(e) {
+    e.preventDefault();
+    doSearch(1);
+});
 
-/**
- * Format tiền VND
- */
-function formatCurrency(amount) {
-    return new Intl.NumberFormat('vi-VN').format(amount) + ' ₫';
-}
-
-/**
- * Escape HTML để tránh XSS
- */
-function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.appendChild(document.createTextNode(text));
-    return div.innerHTML;
-}
+// Debounce tìm kiếm khi gõ
+let debounceTimer;
+document.getElementById('keyword').addEventListener('input', function() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => doSearch(1), 500);
+});
 </script>
-
 </body>
 </html>
+<?php
+// ---- Hàm render PHP (dùng cho SSR lần đầu) ----
+function renderProductCard(array $p): string
+{
+    $price = number_format($p['selling_price'], 0, ',', '.');
+    $img   = $p['image'] ?: 'assets/images/no-image.png';
+    return <<<HTML
+    <div class="col">
+      <div class="card h-100 shadow-sm">
+        <img src="{$img}" class="card-img-top p-2" alt="{$p['name']}" style="height:200px;object-fit:contain">
+        <div class="card-body d-flex flex-column">
+          <span class="badge bg-secondary mb-1">{$p['category_name']}</span>
+          <h6 class="card-title flex-grow-1">{$p['name']}</h6>
+          <p class="fw-bold text-danger mb-1">{$price} đ</p>
+          <p class="text-muted small mb-2">Còn: {$p['stock_quantity']} máy</p>
+          <div class="d-flex gap-2">
+            <a href="pages/product_detail.php?id={$p['id']}" class="btn btn-outline-primary btn-sm flex-grow-1">Chi tiết</a>
+            <button onclick="addToCart({$p['id']})" class="btn btn-danger btn-sm flex-grow-1">🛒 Mua</button>
+          </div>
+        </div>
+      </div>
+    </div>
+HTML;
+}
+
+function renderPagination(int $current, int $total_pages): string
+{
+    if ($total_pages <= 1) return '';
+    $html = '<ul class="pagination">';
+    if ($current > 1) {
+        $html .= "<li class='page-item'><a class='page-link' href='?page=" . ($current-1) . "'>«</a></li>";
+    }
+    $start = max(1, $current - 2);
+    $end   = min($total_pages, $current + 2);
+    for ($i = $start; $i <= $end; $i++) {
+        $active = $i === $current ? 'active' : '';
+        $html  .= "<li class='page-item $active'><a class='page-link' href='?page=$i'>$i</a></li>";
+    }
+    if ($current < $total_pages) {
+        $html .= "<li class='page-item'><a class='page-link' href='?page=" . ($current+1) . "'>»</a></li>";
+    }
+    $html .= '</ul>';
+    return $html;
+}
